@@ -18,14 +18,38 @@ WORD = re.compile(r"[a-z0-9$%.]+")
 
 
 class NaiveKnowledge:
+    """Naive keyword-search knowledge base over website snapshots.
+
+    Stores only the latest version of each page and answers questions by
+    returning the paragraph with the greatest word overlap with the question.
+    """
+
     def __init__(self):
-        self.pages = {}  # url -> (snapshot_id, markdown)
+        """Initialize an empty store mapping url -> (snapshot_id, markdown)."""
+        self.pages = {}
 
     def ingest(self, snapshot: Snapshot) -> None:
+        """Ingest one snapshot, keeping only the newest copy of each page.
+
+        Args:
+            snapshot: A snapshot of the website. Called once per snapshot,
+                oldest first, so later snapshots overwrite earlier pages.
+        """
         for p in snapshot.pages:
-            self.pages[p.url] = (snapshot.snapshot_id, p.markdown)
+                self.pages[p.url] = (snapshot.snapshot_id, p.markdown)
 
     def answer(self, question, as_of=None):
+        """Answer a question with the best keyword-matching paragraph.
+
+        Args:
+            question: Natural-language question to answer.
+            as_of: Optional point in time for the answer. Currently ignored.
+
+        Returns:
+            An Answer containing the best-matching paragraph (up to 600 chars)
+            and its source, or a non-confident "I don't know." if no paragraph
+            shares a word with the question.
+        """
         q = set(WORD.findall(question.lower()))
         best, best_score = None, 0
         for url, (sid, md) in self.pages.items():
@@ -39,8 +63,10 @@ class NaiveKnowledge:
         return Answer(text=para[:600], sources=[Source(url=url, snapshot_id=sid)])
 
     def conflicts(self):
+        """Return detected conflicts between pages (none; not implemented)."""
         return []
 
 
 def build():
+    """Create and return the knowledge-base instance used by the harness."""
     return NaiveKnowledge()
