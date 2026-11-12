@@ -41,12 +41,14 @@ YEAR = re.compile(r"\b(19\d\d|20[0-3]\d)\b")
 STOPWORDS = frozenset(
     "a an and are as at be by can do does for from how i in is it my of on or the to what when "
     "where which who will with you your me tell give provide get would like know please about "
-    "dupaco s".split()
+    "dupaco s was were been did has had last".split()
 )
 # Words that signal "give me a rate" but say nothing about WHICH product.
 GENERIC = frozenset(
     "rate rates interest current currently right now today apy apr dividend dividends percent "
-    "percentage annual yield much charge pay earn offer offers have there any all list balance between tier account accounts standard".split()
+    "percentage annual yield much charge pay earn offer offers have there any all list balance between tier account accounts standard "
+    "highest lowest best top maximum minimum most least their they them these those some also should could use want need "
+    "january february march april may june july august september october november december".split()
 )
 RATE_INTENT = frozenset("rate rates interest apy apr dividend yield percentage".split())
 SYNONYMS = {
@@ -283,7 +285,16 @@ class SnapshotStore:
         q_tokens = [t for t in q_tokens if not (year and t == str(year))]
         if not q_tokens:
             return [], 0.0
-        weights = {t: self.fact_idf.get(t, 1.0) for t in q_tokens}
+        max_idf = max(self.fact_idf.values(), default=1.0)
+
+        def weight(t):
+            """idf of the token; synonyms' idf if unseen; a word no table uses is maximally distinctive."""
+            if t in self.fact_idf:
+                return self.fact_idf[t]
+            syn = [self.fact_idf[x] for x in SYNONYMS.get(t, ()) if x in self.fact_idf]
+            return max(syn) if syn else max_idf
+
+        weights = {t: weight(t) for t in q_tokens}
         total = sum(weights.values())
 
         scored = []
@@ -429,7 +440,7 @@ class FactStore:
     @staticmethod
     def _apply_superlative(question, facts):
         """'highest'/'lowest' questions return only the extreme row."""
-        words = set(tokenize(question))
+        words = set(tokenize(question, keep_stop=True))
         for word, pick in (("highest", max), ("best", max), ("maximum", max), ("lowest", min), ("minimum", min)):
             if word in words:
                 metric = next((m for m in ("apy", "apr", "rate") if all(m in f.values for f in facts)), None)

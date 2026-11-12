@@ -83,3 +83,9 @@ Hidden questions include re-worded versions of the public ones, "as of" date que
 - Use only the snapshots provided to answer questions. No live website calls.
 - Each `answer` call must finish within 60 seconds.
 - The data is a real credit union's public website, shared for this event only. Don't redistribute it.
+
+### Run Test harness
+```
+python3 harness/run_eval.py --submission facts --eval eval/public_eval.jsonl
+```
+
