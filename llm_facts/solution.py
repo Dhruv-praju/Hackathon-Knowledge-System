@@ -154,6 +154,42 @@ def named_page_paragraph(store, question):
     return (best[1], best[2]) if best else None
 
 
+LINK = re.compile(r"\[([^\]\n]{2,60})\]\((https?://[^)\s\"]+)")
+JOIN_INTENT = re.compile(r"\bhow (?:do|can|would) i (?:join|apply|open|sign up|enroll|register)\b", re.I)
+SKIP_LINK = re.compile(r"/author/|/tag/|/learn/|/newsroom/|/hubfs/|\.(?:svg|png|jpg|pdf)\b|read more|learn more|click here", re.I)
+
+
+def link_for(store, question):
+    """Best call-to-action link: the URL whose anchor text covers the question's words, most-used first."""
+    q = [t for t in dict.fromkeys(T.tokenize(question)) if t not in T.GENERIC and t not in URL_WORDS]
+    q = [SYN.get(t, t) for t in q]
+    if not q:
+        return None
+    counts = {}
+    for _, para, _c in store.paragraphs:
+        for anchor, url in LINK.findall(para):
+            if SKIP_LINK.search(anchor + " " + url):
+                continue
+            key = (tuple(T.tokenize(anchor)), url.split("?")[0].rstrip("/") + ("/" if url.split("?")[0].count("/") < 3 else ""))
+            counts[key] = counts.get(key, 0) + 1
+    best = None
+    for (atoks, url), n in counts.items():
+        a = {SYN.get(t, t) for t in atoks}
+        if not a:
+            continue
+        cover = sum(1 for t in q if t in a) / len(q)
+        precision = sum(1 for t in a if t in q) / len(a)
+        if cover >= 0.5 and precision >= 0.5:
+            key = (cover * precision, n)
+            if best is None or key > best[0]:
+                best = (key, url)
+    return best[1] if best else None
+
+
+SYN = {"cd": "certificate", "cds": "certificate"}
+HOURS_VARY = re.compile(r"\b(all|same|every|general|typical|vary|varies)\b", re.I)
+
+
 def page_hash(page):
     """Cache key: content + prompt version + model."""
     return hashlib.sha256(f"{PROMPT_VERSION}|{MODEL}|{page.url}|{page.markdown}".encode()).hexdigest()[:32]
@@ -396,6 +432,13 @@ class LLMFactStore:
             hit = index.lookup_url(question)
             if hit:
                 return Answer(text=f"{hit.entity} - {hit.attribute}: {hit.value}", sources=[Source(url=hit.url, snapshot_id=store.snapshot_id, quote=hit.quote[:200])])
+        if URL_INTENT.search(question) or JOIN_INTENT.search(question):
+            url = link_for(store, question)
+            if url:
+                return Answer(text=url, sources=[Source(url=url, snapshot_id=store.snapshot_id)])
+        hours = self._hours_overview(question, index, store)
+        if hours:
+            return hours
         facts = index.lookup(question) or index.lookup(question, with_value=True)
         if facts and rate_intent and not any("%" in f.value for f in facts):
             facts = []  # asked for a rate, found only prose about the product: the site publishes no rate
@@ -419,6 +462,24 @@ class LLMFactStore:
             return Answer(text="I don't know.", confident=False)
         url, para = hit
         return Answer(text=para[:600], sources=[Source(url=url, snapshot_id=store.snapshot_id, quote=para[:200])])
+
+    @staticmethod
+    def _hours_overview(question, index, store):
+        """'Do all branches have the same lobby hours?': list each distinct schedule once and say it varies by branch."""
+        q = question.lower()
+        kind = "drive-up" if "drive" in q else "lobby" if "lobby" in q else None
+        if not kind or "hour" not in q or not HOURS_VARY.search(q) or re.search(r"\bbranch\b.*\b(of|in|at)\b [A-Z]", question):
+            return None
+        by_value = {}
+        for f in index.facts:
+            if f.status == "current" and kind in f.attribute.lower() and "hour" in f.attribute.lower() and re.search(r"\d", f.value):
+                by_value.setdefault(re.sub(r"\s+", " ", f.value.lower().replace("–", "-")), []).append(f)
+        if not by_value:
+            return None
+        groups = sorted(by_value.values(), key=len, reverse=True)[:6]
+        lines = [f"Hours vary by branch ({len(by_value)} different {kind} schedules are published); please tell me which branch."]
+        lines += [f"{g[0].entity}{' and ' + str(len(g) - 1) + ' more' if len(g) > 1 else ''}: {g[0].value}" for g in groups]
+        return Answer(text="\n".join(lines), sources=[Source(url=g[0].url, snapshot_id=store.snapshot_id, quote=g[0].quote[:200]) for g in groups[:2]])
 
     def _unknown_name(self, question, store):
         """True when the question names a place/product (capitalised, mid-sentence) that appears nowhere on the site."""
