@@ -30,10 +30,10 @@ Optional env vars: `LLM_FACTS_MODEL`, `LLM_FACTS_WORKERS`, `LLM_FACTS_BUDGET_S`,
 | conflict_resolution | 1.00 |
 | temporal_as_of | 1.00 |
 | branch_info | 0.95 |
-| stale_trap | 0.91 |
+| stale_trap | 0.98 |
 | list_completeness | 0.75 |
-| entity_attribution | 0.75 |
-| current_value | 0.67 |
-| should_refuse | 0.67 |
+| entity_attribution | 1.00 |
+| current_value | 1.00 |
+| should_refuse | 1.00 |
 
-The `conflicts()` score is not part of this output because the public run has no `--conflicts-gold` file. Known misses: certificate read-back (needs `--judge`), a "Mullan Avenue" refusal, update-contact-info, and a student-loan question.
+The `conflicts()` score is not part of this output because the public run has no `--conflicts-gold` file. Known misses: certificate read-back (needs `--judge`), and three questions that lose the 15% source credit because the expected page (home page, `/contact`, savings-account) is not where our facts came from.

@@ -1,0 +1,8 @@
+[
+  {"id": "c-branches", "topic_keywords": ["branch"], "values": ["22", "23", "24"], "correct_value": "22"},
+  {"id": "c-30yr-832k", "topic_keywords": ["30-year", "832,750"], "values": ["6.00%", "7.25%"], "correct_value": "7.25%"},
+  {"id": "c-30yr-100k", "topic_keywords": ["30-year", "100,000"], "values": ["5.75%", "7.13%"], "correct_value": "7.13%"},
+  {"id": "c-15yr", "topic_keywords": ["15-year"], "values": ["5.50%", "6.75%"], "correct_value": "6.75%"},
+  {"id": "c-savings-tier", "topic_keywords": ["5,000"], "values": ["2.47%", "2.96%"], "correct_value": "2.96%"},
+  {"id": "c-refi-30yr", "topic_keywords": ["refinance", "30-year"], "values": ["6.00%", "7.25%"], "correct_value": "7.25%"}
+]

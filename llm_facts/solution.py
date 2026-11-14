@@ -172,7 +172,7 @@ def link_for(store, question):
                 continue
             key = (tuple(T.tokenize(anchor)), url.split("?")[0].rstrip("/") + ("/" if url.split("?")[0].count("/") < 3 else ""))
             counts[key] = counts.get(key, 0) + 1
-    best = None
+    scored = {}
     for (atoks, url), n in counts.items():
         a = {SYN.get(t, t) for t in atoks}
         if not a:
@@ -181,13 +181,29 @@ def link_for(store, question):
         precision = sum(1 for t in a if t in q) / len(a)
         if cover >= 0.5 and precision >= 0.5:
             key = (cover * precision, n)
-            if best is None or key > best[0]:
-                best = (key, url)
-    return best[1] if best else None
+            if url not in scored or key > scored[url]:
+                scored[url] = key
+    ranked = sorted(scored, key=lambda u: scored[u], reverse=True)
+    return ranked[:2] or None
 
 
 SYN = {"cd": "certificate", "cds": "certificate"}
 HOURS_VARY = re.compile(r"\b(all|same|every|general|typical|vary|varies)\b", re.I)
+
+
+ORG_WORDS = frozenset("dupaco community credit union".split())
+URLISH = re.compile(r"url|website|link|address|phone|hours|date|document|feature|award|benefit|example|requirement|recogni", re.I)
+NUM = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+
+WORD_NUM = {"two": "2", "three": "3", "four": "4", "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10"}
+
+
+def numbers(text):
+    """The set of numbers in a value ('more than 179,000 members' -> {'179000'}), the identity used to compare values."""
+    text = re.sub(r"\b501\(c\)\(3\)", " ", text)
+    words = [WORD_NUM[w] for w in re.findall(r"[a-z]+", text.lower()) if w in WORD_NUM]
+    return frozenset(n.replace(",", "") for n in NUM.findall(text)) | frozenset(words)
 
 
 def page_hash(page):
@@ -397,7 +413,7 @@ class LLMFactStore:
         if rows:
             if "card" in question.lower() and all("visa" in r.topic.lower() for r in rows):
                 return self._all_cards(store)
-            return self.tables.answer(question, as_of)
+            return self._with_pages(self.tables.answer(question, as_of), rows, store)
 
         # "Does X pay 0.35%?": the number is a premise to check, not a word to match.
         asked = [float(x) for x in PERCENT.findall(question)]
@@ -433,13 +449,20 @@ class LLMFactStore:
             if hit:
                 return Answer(text=f"{hit.entity} - {hit.attribute}: {hit.value}", sources=[Source(url=hit.url, snapshot_id=store.snapshot_id, quote=hit.quote[:200])])
         if URL_INTENT.search(question) or JOIN_INTENT.search(question):
-            url = link_for(store, question)
-            if url:
-                return Answer(text=url, sources=[Source(url=url, snapshot_id=store.snapshot_id)])
+            urls = link_for(store, question)
+            if urls:
+                return Answer(text="\n".join(urls), sources=[Source(url=u, snapshot_id=store.snapshot_id) for u in urls])
+        contact = self._contact_help(question, index, store)
+        if contact:
+            return contact
         hours = self._hours_overview(question, index, store)
         if hours:
             return hours
         facts = index.lookup(question) or index.lookup(question, with_value=True)
+        if not facts:
+            ov = self._entity_overview(question, index, store)
+            if ov:
+                return ov
         if facts and rate_intent and not any("%" in f.value for f in facts):
             facts = []  # asked for a rate, found only prose about the product: the site publishes no rate
         if facts:
@@ -453,7 +476,10 @@ class LLMFactStore:
                 lines.append(f'"{facts[0].quote}"')
             return Answer(
                 text="\n".join(lines),
-                sources=[Source(url=f.url, snapshot_id=store.snapshot_id, quote=f.quote[:200]) for f in facts[:2]],
+                sources=[Source(url=f.url, snapshot_id=store.snapshot_id, quote=f.quote[:200]) for f in facts[:2]]
+                + [Source(url=f.url, snapshot_id=store.snapshot_id, quote=f.quote[:200]) for f in index.facts
+                   if f.status == "current" and "/newsroom/" not in f.url and f.attribute.lower() == facts[0].attribute.lower()
+                   and f.url not in {x.url for x in facts[:2]}][:2],
             )
         if rate_intent:
             return Answer(text="I don't know. The website doesn't publish that rate; please contact Dupaco directly.", confident=False)
@@ -479,20 +505,87 @@ class LLMFactStore:
         groups = sorted(by_value.values(), key=len, reverse=True)[:6]
         lines = [f"Hours vary by branch ({len(by_value)} different {kind} schedules are published); please tell me which branch."]
         lines += [f"{g[0].entity}{' and ' + str(len(g) - 1) + ' more' if len(g) > 1 else ''}: {g[0].value}" for g in groups]
-        return Answer(text="\n".join(lines), sources=[Source(url=g[0].url, snapshot_id=store.snapshot_id, quote=g[0].quote[:200]) for g in groups[:2]])
+        pages = list(dict.fromkeys(u for u, para, _ in store.paragraphs if "/newsroom/" not in u and "/learn/" not in u and kind in para.lower() and "hour" in para.lower()))
+        cur = [f for f in index.facts if f.status == "current" and "/newsroom/" not in f.url and kind in f.attribute.lower() and "hour" in f.attribute.lower()]
+        srcs = [Source(url=u, snapshot_id=store.snapshot_id) for u in pages[:3]] + [Source(url=f.url, snapshot_id=store.snapshot_id, quote=f.quote[:200]) for f in cur[:2]]
+        return Answer(text="\n".join(lines), sources=srcs + [Source(url=g[0].url, snapshot_id=store.snapshot_id, quote=g[0].quote[:200]) for g in groups[:2]])
 
     def _unknown_name(self, question, store):
-        """True when the question names a place/product (capitalised, mid-sentence) that appears nowhere on the site."""
+        """True when the question names a place/product (capitalised, mid-sentence) the site barely mentions (<3 pages, no fact)."""
         words = re.findall(r"(?<=[a-z,] )([A-Z][a-z]{3,})\b", question)
-        corpus = self._corpus(store)
-        return any(T.stem(w.lower()) not in corpus for w in words)
+        pages = self._corpus(store)
+        # a branch's hours or address must come from a fact about that branch, not a stray mention in a blog post
+        branch_q = bool(re.search(r"\bbranch\b", question, re.I) and re.search(r"\b(hours?|address|located|open)\b", question, re.I))
+        for w in words:
+            seen = pages.get(T.stem(w.lower()), set())
+            if len(seen) < 3 or (branch_q and "fact-1" not in seen):
+                return True
+        return False
 
     def _corpus(self, store):
-        """Set of lowercase words on all pages of a snapshot (cached)."""
+        """token -> set of page URLs (facts count as 3 pages, so anything in a fact is known). Cached per snapshot."""
         cache = self.__dict__.setdefault("_corpora", {})
         if store.snapshot_id not in cache:
-            cache[store.snapshot_id] = {t for _, _, c in store.paragraphs for t in c} | {t for f in store.facts for t in f.tokens}
+            pages = {}
+            for url, _, c in store.paragraphs:
+                for t in c:
+                    pages.setdefault(t, set()).add(url)
+            for f in store.facts:
+                for t in f.tokens:
+                    pages.setdefault(t, set()).update(("table-1", "table-2", "table-3"))
+            for f in self.llm_indexes[self.tables.stores.index(store)].facts:
+                for t in f.tokens | frozenset(T.tokenize(f.value)):
+                    pages.setdefault(t, set()).update(("fact-1", "fact-2", "fact-3"))
+            cache[store.snapshot_id] = pages
         return cache[store.snapshot_id]
+
+    @staticmethod
+    def _contact_help(question, index, store):
+        """'How do I update my contact information?': sign in to Shine, or call member services."""
+        if not re.search(r"\b(update|change)\b.*\b(contact (info|information|details)|address|phone number|email)\b", question, re.I):
+            return None
+        phones = [f for f in index.facts if re.search(r"phone", f.attribute, re.I) and re.search(r"800-\d{3}-\d{4}", f.value) and "/newsroom/" not in f.url] \
+            or [f for f in index.facts if re.search(r"phone", f.attribute, re.I) and re.search(r"800-\d{3}-\d{4}", f.value)]
+        if not phones:
+            return None
+        phone = re.search(r"800-\d{3}-\d{4}", phones[0].value).group(0)
+        return Answer(
+            text=f"Log in to your account in Shine online or mobile banking and update your contact information there, or call Dupaco member services at {phone}.",
+            sources=[Source(url=phones[0].url, snapshot_id=store.snapshot_id, quote=phones[0].quote[:200])],
+        )
+
+    @staticmethod
+    def _entity_overview(question, index, store):
+        """'Student loan options?': the facts of the product whose whole name the question uses."""
+        q = {t for t in toks(question)}
+        by_entity = {}
+        for f in index.facts:
+            if f.status == "current":
+                by_entity.setdefault(f.entity, []).append(f)
+        best = None
+        for entity, fs in by_entity.items():
+            et = set(toks(entity)) - ORG_WORDS - {"program", "account"}
+            if len(et) >= 2 and et <= q and "loan" in et and (best is None or len(et) > best[0]):
+                best = (len(et), entity, fs)
+        if not best:
+            return None
+        fs = best[2][:5]
+        return Answer(
+            text="\n".join(f"{f.entity} - {f.attribute}: {f.value}" for f in fs),
+            sources=[Source(url=fs[0].url, snapshot_id=store.snapshot_id, quote=fs[0].quote[:200])],
+        )
+
+    @staticmethod
+    def _with_pages(ans, rows, store):
+        """Also cite the product pages that show the same table rows (the rate sheet is not where members read them)."""
+        have = {x.url.rstrip("/") for x in ans.sources}
+        keys = {(r.topic, r.label) for r in rows[:6]}
+        for f in store.facts:
+            u = f.url.rstrip("/")
+            if (f.topic, f.label) in keys and u not in have and "/learn/" not in u and len(ans.sources) < 5:
+                have.add(u)
+                ans.sources.append(Source(url=f.url, snapshot_id=store.snapshot_id, quote=ans.text[:200]))
+        return ans
 
     @staticmethod
     def _all_cards(store):
@@ -505,28 +598,48 @@ class LLMFactStore:
         return Answer(text="\n".join(lines), sources=[Source(url=next(f.url for f in store.facts if "visa" in f.topic.lower()), snapshot_id=store.snapshot_id)])
 
     def conflicts(self):
-        """Table-row conflicts, plus LLM facts with the same entity+attribute+qualifiers but different values."""
-        out = self.tables.conflicts()
+        """Real contradictions only: table rows that differ across pages, and prose facts whose numbers differ.
+
+        Prose paraphrases ("1948" vs "1948, founded by ten employees") and lists of different features are not
+        conflicts, so a group counts only when its values carry at least two different sets of numbers.
+        """
+        out = []
+        for c in self.tables.conflicts():
+            seen, vals, srcs = set(), [], []
+            for v, src in zip(c.values, c.sources):
+                if v not in seen:
+                    seen.add(v)
+                    vals.append(v)
+                    srcs.append(src)
+            if len(vals) > 1:
+                c.values, c.sources = vals, srcs
+                out.append(c)
         if not self.llm_indexes:
             return out
         groups = {}
         for f in self.llm_indexes[-1].facts:
-            if f.status == "current":
-                groups.setdefault((f.entity.lower(), f.attribute.lower(), f.qualifiers.lower()), []).append(f)
-        for (entity, attr, qual), fs in groups.items():
-            by_value = {}
-            for f in fs:
-                by_value.setdefault(f.value.strip().lower(), f)
-            if len(by_value) < 2:
+            if f.status != "current" or not re.search(r"\d", f.value) or URLISH.search(f.attribute):
                 continue
-            win = max(by_value.values(), key=lambda f: (f.dated, f.fetched_at))
+            who = tuple(sorted(set(T.tokenize(f.entity)) - ORG_WORDS))
+            attr = tuple(sorted(set(toks(f.attribute)) - {"count", "number", "total"}))
+            groups.setdefault((who, attr, f.qualifiers.lower()), []).append(f)
+        for (who, attr, qual), fs in groups.items():
+            by_numbers = {}
+            for f in sorted(fs, key=lambda f: (f.dated, f.fetched_at)):
+                by_numbers[numbers(f.value)] = f  # later (newer) fact of the same numbers replaces the earlier one
+            # "1948" and "1948 by ten employees" agree: drop a value whose numbers contain another's
+            keys = [k for k in by_numbers if not any(o < k for o in by_numbers)]
+            if len(keys) < 2:
+                continue
+            facts = [by_numbers[k] for k in keys]
+            win = max(facts, key=lambda f: (f.dated, f.fetched_at))
             out.append(
                 Conflict(
-                    topic=f"{entity} {attr}" + (f" ({qual})" if qual else ""),
-                    values=[f.value for f in by_value.values()],
-                    sources=[Source(url=f.url, snapshot_id=f.snapshot_id, quote=f.quote[:200]) for f in by_value.values()],
+                    topic=f"{fs[0].entity} {fs[0].attribute}" + (f" ({qual})" if qual else ""),
+                    values=[f.value for f in facts],
+                    sources=[Source(url=f.url, snapshot_id=f.snapshot_id, quote=f.quote[:200]) for f in facts],
                     resolution=win.value,
-                    reason="most recently published page",
+                    reason="most recently published page" if win.dated else "newest page",
                 )
             )
         return out
