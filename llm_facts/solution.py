@@ -109,6 +109,51 @@ def toks(text):
     return [NORMALIZE.get(t, t) for t in T.tokenize(text)]
 
 
+URL_INTENT = re.compile(r"\b(url|link|web ?site|web ?page)\b", re.I)
+URL_WORDS = frozenset("url link website webpage page see use should".split())
+
+
+def rare_term_paragraph(store, question):
+    """Paragraph search restricted to paragraphs holding the question's rarest word (a name like 'Forbes'), newest page first."""
+    q = [t for t in dict.fromkeys(T.tokenize(question)) if t in store.para_idf and t not in T.GENERIC]
+    if len(q) < 2:
+        return None
+    rare = max(q, key=lambda t: store.para_idf[t])
+    if sum(1 for _, _, c in store.paragraphs if rare in c) > 60:
+        return None  # not distinctive enough to restrict on
+    paras = [(u, p, c) for u, p, c in store.paragraphs if rare in c]
+    if not paras:
+        return None
+    best = None
+    for u, p, c in paras:
+        score = sum(store.para_idf[t] * min(c.get(t, 0), 2) for t in q) / (1 + len(p) / 600)
+        if best is None or score > best[0]:
+            best = (score, u, p)
+    return best[1], best[2]
+
+
+RECOGNITION = re.compile(r"\b(recogni\w*|awards?|ranks?|ranked|ranking|named|honou?rs?)\b", re.I)
+
+
+def named_page_paragraph(store, question):
+    """'What recognition from Forbes?': the lead of the newest article whose URL names the organisation."""
+    names = [w.lower() for w in re.findall(r"(?<=[a-z,] )([A-Z][a-z]{3,})\b", question) if w.lower() != "dupaco"]
+    if not names or not RECOGNITION.search(question):
+        return None
+    pages = {}
+    for url, para, _ in store.paragraphs:
+        if "/newsroom/" in url and any(n in url.lower().split("/newsroom/", 1)[1] for n in names):
+            pages.setdefault(url, []).append(para)
+    best = None
+    for url, paras in pages.items():
+        m = next((DATE.search(p) for p in paras[:4] if DATE.search(p)), None)
+        when = f"{m.group(3)}-{MONTHS[m.group(1)]:02d}-{int(m.group(2)):02d}" if m else ""
+        lead = next((p for p in paras if len(p) > 120 and not p.startswith(("[", "!", "#"))), None)
+        if lead and (best is None or when > best[0]):
+            best = (when, url, lead)
+    return (best[1], best[2]) if best else None
+
+
 def page_hash(page):
     """Cache key: content + prompt version + model."""
     return hashlib.sha256(f"{PROMPT_VERSION}|{MODEL}|{page.url}|{page.markdown}".encode()).hexdigest()[:32]
@@ -201,7 +246,22 @@ class LLMFactIndex:
         self.idf = {t: T.math.log(1 + n / c) for t, c in df.items()}
         self.max_idf = max(self.idf.values(), default=1.0)
 
-    def lookup(self, question, limit=4):
+    def lookup_url(self, question):
+        """Best 'URL' fact for a link question: overlap of the question's content words with the fact's name and URL."""
+        q = [t for t in toks(question) if t not in T.GENERIC and t not in QUESTION_NOISE and t not in URL_WORDS]
+        if not q:
+            return None
+        best = None
+        for f in self.facts:
+            if f.status == "expired" or not re.search(r"url|link", f.attribute.lower()) or "http" not in f.value:
+                continue
+            ft = f.tokens | set(T.tokenize(f.value))
+            score = sum(self.idf.get(t, self.max_idf) for t in q if t in ft) / sum(self.idf.get(t, self.max_idf) for t in q)
+            if score >= 0.3 and (best is None or score > best[0]):
+                best = (score, f)
+        return best[1] if best else None
+
+    def lookup(self, question, limit=4, with_value=False):
         """Return the facts that best explain the question (current, newest first), or []."""
         q = [t for t in toks(question) if t not in T.GENERIC and t not in QUESTION_NOISE]
         if not q or not self.facts:
@@ -213,7 +273,8 @@ class LLMFactIndex:
         for f in self.facts:
             if f.status == "expired":
                 continue
-            matched = sum(w[t] for t in q if t in f.tokens or (eligibility and t == "member" and "membership" in f.tokens))
+            ft = f.tokens | frozenset(T.tokenize(f.value)) if with_value else f.tokens
+            matched = sum(w[t] for t in q if t in ft or (eligibility and t == "member" and "membership" in f.tokens))
             recall = matched / total
             if recall >= self.MIN_RECALL:
                 precision = matched / (sum(self.idf[t] for t in f.tokens) or 1.0)
@@ -298,6 +359,8 @@ class LLMFactStore:
 
         rows, _ = store.lookup(question)
         if rows:
+            if "card" in question.lower() and all("visa" in r.topic.lower() for r in rows):
+                return self._all_cards(store)
             return self.tables.answer(question, as_of)
 
         # "Does X pay 0.35%?": the number is a premise to check, not a word to match.
@@ -323,7 +386,19 @@ class LLMFactStore:
                         sources=[Source(url=rows[0].url, snapshot_id=store.snapshot_id, quote=T.render(rows[0])[:200])],
                     )
 
-        facts = self.llm_indexes[i].lookup(question)
+        index = self.llm_indexes[i]
+        named = named_page_paragraph(store, question)
+        if named:
+            return Answer(text=named[1][:600], sources=[Source(url=named[0], snapshot_id=store.snapshot_id, quote=named[1][:200])])
+        if self._unknown_name(question, store):
+            return Answer(text="I don't know. I couldn't find that on the website; please contact Dupaco directly.", confident=False)
+        if URL_INTENT.search(question):
+            hit = index.lookup_url(question)
+            if hit:
+                return Answer(text=f"{hit.entity} - {hit.attribute}: {hit.value}", sources=[Source(url=hit.url, snapshot_id=store.snapshot_id, quote=hit.quote[:200])])
+        facts = index.lookup(question) or index.lookup(question, with_value=True)
+        if facts and rate_intent and not any("%" in f.value for f in facts):
+            facts = []  # asked for a rate, found only prose about the product: the site publishes no rate
         if facts:
             if re.search(r"\bhow many\b|\bnumber of\b|\bcount\b", question.lower()):
                 facts = facts[:1]  # a count has one value; extra lines only add conflicting numbers
@@ -339,11 +414,34 @@ class LLMFactStore:
             )
         if rate_intent:
             return Answer(text="I don't know. The website doesn't publish that rate; please contact Dupaco directly.", confident=False)
-        hit = store.best_paragraph(question)
+        hit = rare_term_paragraph(store, question) or store.best_paragraph(question)
         if not hit:
             return Answer(text="I don't know.", confident=False)
         url, para = hit
         return Answer(text=para[:600], sources=[Source(url=url, snapshot_id=store.snapshot_id, quote=para[:200])])
+
+    def _unknown_name(self, question, store):
+        """True when the question names a place/product (capitalised, mid-sentence) that appears nowhere on the site."""
+        words = re.findall(r"(?<=[a-z,] )([A-Z][a-z]{3,})\b", question)
+        corpus = self._corpus(store)
+        return any(T.stem(w.lower()) not in corpus for w in words)
+
+    def _corpus(self, store):
+        """Set of lowercase words on all pages of a snapshot (cached)."""
+        cache = self.__dict__.setdefault("_corpora", {})
+        if store.snapshot_id not in cache:
+            cache[store.snapshot_id] = {t for _, _, c in store.paragraphs for t in c} | {t for f in store.facts for t in f.tokens}
+        return cache[store.snapshot_id]
+
+    @staticmethod
+    def _all_cards(store):
+        """Every credit card (personal and business) with its APR, from every page."""
+        seen, lines = set(), []
+        for f in store.facts:
+            if "visa" in f.topic.lower() and "apr" in f.values and (f.topic, f.label, f.values["apr"]) not in seen:
+                seen.add((f.topic, f.label, f.values["apr"]))
+                lines.append(T.render(f))
+        return Answer(text="\n".join(lines), sources=[Source(url=next(f.url for f in store.facts if "visa" in f.topic.lower()), snapshot_id=store.snapshot_id)])
 
     def conflicts(self):
         """Table-row conflicts, plus LLM facts with the same entity+attribute+qualifiers but different values."""
