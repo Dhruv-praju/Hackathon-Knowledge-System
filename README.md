@@ -18,9 +18,9 @@ Optional env vars: `LLM_FACTS_MODEL`, `LLM_FACTS_WORKERS`, `LLM_FACTS_BUDGET_S`,
 
 | Metric | Value |
 |---|---|
-| Final score | **0.8748** |
+| Final score | **0.9562** (first llm_facts run was 0.5527) |
 | Consistency (paraphrase and repeat) | 1.0 |
-| Speed (p50 / max per answer) | 0.0 s / 0.03 s, score 1.0 |
+| Speed (p50 / p95 / max per answer) | 0.0 s / 0.03 s / 0.06 s, score 1.0 |
 | Stale-trap hits / errors | 0 / 0 |
 | Ingest time | 1.6 s with the cache (limit 30 min) |
 
