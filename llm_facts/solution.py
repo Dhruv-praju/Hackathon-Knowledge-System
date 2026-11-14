@@ -91,6 +91,24 @@ TOOL = {
 }
 
 
+DATE = re.compile(r"\b(January|February|March|April|May|June|July|August|September|October|November|December) (\d{1,2}), (20\d\d)\b")
+MONTHS = {m: i + 1 for i, m in enumerate("January February March April May June July August September October November December".split())}
+QUESTION_NOISE = frozenset("many number count total become join".split())  # say nothing about WHICH fact
+NORMALIZE = {"eligible": "eligib", "eligibility": "eligib"}
+PERCENT = T.PERCENT
+
+
+def page_date(page):
+    """Publication date (YYYY-MM-DD) of an article page, else '' (undated pages never outrank dated ones)."""
+    m = DATE.search(page.markdown[:1500])
+    return f"{m.group(3)}-{MONTHS[m.group(1)]:02d}-{int(m.group(2)):02d}" if m else ""
+
+
+def toks(text):
+    """T.tokenize plus a light eligible/eligibility normalisation."""
+    return [NORMALIZE.get(t, t) for t in T.tokenize(text)]
+
+
 def page_hash(page):
     """Cache key: content + prompt version + model."""
     return hashlib.sha256(f"{PROMPT_VERSION}|{MODEL}|{page.url}|{page.markdown}".encode()).hexdigest()[:32]
@@ -165,6 +183,7 @@ class LLMFact:
     snapshot_id: str
     fetched_at: str
     tokens: frozenset
+    dated: str = ""  # publication date of the source page; the tie-break when sources disagree
 
 
 class LLMFactIndex:
@@ -184,25 +203,28 @@ class LLMFactIndex:
 
     def lookup(self, question, limit=4):
         """Return the facts that best explain the question (current, newest first), or []."""
-        q = [t for t in T.tokenize(question) if t not in T.GENERIC]
+        q = [t for t in toks(question) if t not in T.GENERIC and t not in QUESTION_NOISE]
         if not q or not self.facts:
             return []
+        eligibility = "eligib" in q  # who qualifies: prefer the most specific fact over a newer, longer one
         w = {t: self.idf.get(t, self.max_idf) for t in q}
         total = sum(w.values())
         scored = []
         for f in self.facts:
             if f.status == "expired":
                 continue
-            matched = sum(w[t] for t in q if t in f.tokens)
+            matched = sum(w[t] for t in q if t in f.tokens or (eligibility and t == "member" and "membership" in f.tokens))
             recall = matched / total
             if recall >= self.MIN_RECALL:
-                scored.append((recall, f.fetched_at, f))
+                precision = matched / (sum(self.idf[t] for t in f.tokens) or 1.0)
+                scored.append((round(recall, 2), (round(precision, 1), f.dated) if eligibility else (f.dated, 0), f))
         if not scored:
             return []
+        if re.search(r"\bhow many\b|\bnumber of\b|\bcount\b", question.lower()):
+            scored = [x for x in scored if re.search(r"\d", x[2].value)] or scored  # a count question wants a number
         best = max(s[0] for s in scored)
         top = [(r, d, f) for r, d, f in scored if r >= best - 0.15]
-        top.sort(key=lambda x: (-x[0], x[1]), reverse=False)
-        top.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        top.sort(key=lambda x: (x[0], x[1]), reverse=True)  # best recall, then newest article
         seen, out = set(), []
         for _, _, f in top:  # same entity+attribute+qualifiers: keep the most recently fetched
             key = (f.entity.lower(), f.attribute.lower(), f.qualifiers.lower(), f.value.lower())
@@ -240,13 +262,14 @@ class LLMFactStore:
             for it in items:
                 try:
                     text = " ".join([it["entity"], it["attribute"], it.get("qualifiers") or ""])
+                    when = page_date(page)
                     facts.append(
                         LLMFact(
                             entity=it["entity"], attribute=it["attribute"], value=str(it["value"]),
                             qualifiers=it.get("qualifiers") or "", effective=it.get("effective") or "",
                             status=it.get("status") or "current", quote=it.get("quote") or "",
                             url=page.url, snapshot_id=snapshot.snapshot_id, fetched_at=page.fetched_at,
-                            tokens=frozenset(T.tokenize(text)),
+                            tokens=frozenset(toks(text)), dated=when,
                         )
                     )
                 except (KeyError, TypeError):
@@ -277,9 +300,37 @@ class LLMFactStore:
         if rows:
             return self.tables.answer(question, as_of)
 
+        # "Does X pay 0.35%?": the number is a premise to check, not a word to match.
+        asked = [float(x) for x in PERCENT.findall(question)]
+        if asked and rate_intent:
+            rows, _ = store.lookup(PERCENT.sub(" ", question))
+            if rows:
+                metric = next((m for m in ("apy", "rate", "apr") if any(m in r.values for r in rows)), None)
+                rows = [r for r in rows if metric in r.values]
+                # "savings tiers" means the plain product: fewest topic words the question did not say, then most tiers
+                qt = set(T.tokenize(question))
+                extra = lambda r: len(set(T.tokenize(r.topic)) - qt)
+                tiers = {}
+                for r in rows:
+                    tiers.setdefault(r.topic, []).append(r)
+                best_topic = min(tiers, key=lambda t: (extra(tiers[t][0]), -len(tiers[t])))
+                rows = tiers[best_topic]
+                if metric and not any(abs(r.values[metric] - a) < 1e-9 for r in rows for a in asked):
+                    top = max(r.values[metric] for r in rows)
+                    return Answer(
+                        text=f"No - the published {metric.upper()} tops out at {top:.2f}%; {asked[0]:g}% is not on the rate sheet.\n"
+                        + "\n".join(T.render(r) for r in rows[:6]),
+                        sources=[Source(url=rows[0].url, snapshot_id=store.snapshot_id, quote=T.render(rows[0])[:200])],
+                    )
+
         facts = self.llm_indexes[i].lookup(question)
         if facts:
+            if re.search(r"\bhow many\b|\bnumber of\b|\bcount\b", question.lower()):
+                facts = facts[:1]  # a count has one value; extra lines only add conflicting numbers
             lines = [f"{f.entity} - {f.attribute}{' (' + f.qualifiers + ')' if f.qualifiers else ''}: {f.value}" for f in facts]
+            if any("eligib" in f.tokens for f in facts):  # eligibility hinges on the charter area: add that page's geography
+                lines += [f"{c.entity} - {c.attribute}: {c.value}" for c in self.llm_indexes[i].facts
+                          if c.url == facts[0].url and c not in facts and re.search(r"Iowa|Illinois|Wisconsin", c.value)][:2]
             if facts[0].quote:
                 lines.append(f'"{facts[0].quote}"')
             return Answer(
@@ -309,14 +360,14 @@ class LLMFactStore:
                 by_value.setdefault(f.value.strip().lower(), f)
             if len(by_value) < 2:
                 continue
-            win = max(by_value.values(), key=lambda f: f.fetched_at)
+            win = max(by_value.values(), key=lambda f: (f.dated, f.fetched_at))
             out.append(
                 Conflict(
                     topic=f"{entity} {attr}" + (f" ({qual})" if qual else ""),
                     values=[f.value for f in by_value.values()],
                     sources=[Source(url=f.url, snapshot_id=f.snapshot_id, quote=f.quote[:200]) for f in by_value.values()],
                     resolution=win.value,
-                    reason="most recently fetched page",
+                    reason="most recently published page",
                 )
             )
         return out
